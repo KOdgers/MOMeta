@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+### STILL IN PROGRESS ###
 
 
 
@@ -51,7 +52,7 @@ class SEBlock(nn.Module):
         return inputs * x
 
 
-class MobileOneBlock(nn.Module):
+class MOMetaBlock(nn.Module):
     """ MobileOne building block.
 
         This block has a multi-branched architecture at train-time
@@ -69,10 +70,9 @@ class MobileOneBlock(nn.Module):
                  dilation: int = 1,
                  groups: int = 1,
                  inference_mode: bool = False,
-                 meta_mode: bool = False,
                  use_se: bool = False,
                  num_conv_branches: int = 1) -> None:
-        """ Construct a MobileOneBlock module.
+        """ Construct a MOMetaBlock module.
 
         :param in_channels: Number of channels in the input.
         :param out_channels: Number of channels produced by the block.
@@ -85,7 +85,7 @@ class MobileOneBlock(nn.Module):
         :param use_se: Whether to use SE-ReLU activations.
         :param num_conv_branches: Number of linear conv branches.
         """
-        super(MobileOneBlock, self).__init__()
+        super(MOMetaBlock, self).__init__()
         self.inference_mode = inference_mode
         self.groups = groups
         self.stride = stride
@@ -133,7 +133,7 @@ class MobileOneBlock(nn.Module):
         # Inference mode forward pass.
         if self.inference_mode:
             return self.activation(self.se(self.reparam_conv(x)))
-
+           
         # Multi-branched train-time forward pass.
         # Skip branch output
         identity_out = 0
@@ -149,7 +149,8 @@ class MobileOneBlock(nn.Module):
         out = scale_out + identity_out
         for ix in range(self.num_conv_branches):
             out += self.rbr_conv[ix](x)
-
+        if self.meta_mode:
+            out += self.prior_knowledge(x)
         return self.activation(self.se(out))
 
     def reparameterize(self):
@@ -181,16 +182,29 @@ class MobileOneBlock(nn.Module):
             self.__delattr__('rbr_skip')
 
         self.inference_mode = True
-    def condense(self):
-        """ Following works like `RepVGG: Making VGG-style ConvNets Great Again` -
-        https://arxiv.org/pdf/2101.03697.pdf. We re-parameterize multi-branched
-        architecture used at training time to obtain a plain CNN-like structure
-        for inference.
+        
+        
+    def condense_final(self):
         """
-        if self.inference_mode:
-            return
+        NOT TESTED:STILL IN DEVELOLPMENT
+        """
+        self.condense()
+        # Remove zeroed branches
+        for para in self.parameters():
+            para.detach_()
+        self.__delattr__('rbr_conv')
+        self.__delattr__('rbr_scale')
+        if hasattr(self, 'rbr_skip'):
+            self.__delattr__('rbr_skip')
+    
+    
+    def condense(self):
+        """
+        NOT TESTED:STILL IN DEVELOLPMENT
+        """
+
         kernel, bias = self._get_kernel_bias()
-        self.reparam_conv = nn.Conv2d(in_channels=self.rbr_conv[0].conv.in_channels,
+        self.prior_knowledge = nn.Conv2d(in_channels=self.rbr_conv[0].conv.in_channels,
                                       out_channels=self.rbr_conv[0].conv.out_channels,
                                       kernel_size=self.rbr_conv[0].conv.kernel_size,
                                       stride=self.rbr_conv[0].conv.stride,
@@ -198,32 +212,32 @@ class MobileOneBlock(nn.Module):
                                       dilation=self.rbr_conv[0].conv.dilation,
                                       groups=self.rbr_conv[0].conv.groups,
                                       bias=True)
-        self.reparam_conv.weight.data = kernel
-        self.reparam_conv.bias.data = bias
-        """
-        # Delete un-used branches
-        for para in self.parameters():
-            para.detach_()
-        self.__delattr__('rbr_conv')
-        self.__delattr__('rbr_scale')
-        if hasattr(self, 'rbr_skip'):
-            self.__delattr__('rbr_skip')
-        self.rbr_skip = nn.BatchNorm2d(num_features=in_channels) \
-            if out_channels == in_channels and stride == 1 else None
-
-        # Re-parameterizable conv branches
-        rbr_conv = list()
-        for _ in range(self.num_conv_branches):
-            rbr_conv.append(self._conv_bn(kernel_size=kernel_size,
-                                          padding=padding))
-        self.rbr_conv = nn.ModuleList(rbr_conv)
-
-        # Re-parameterizable scale branch
-        self.rbr_scale = None
-        if kernel_size > 1:
-            self.rbr_scale = self._conv_bn(kernel_size=1,
-                                           padding=0)"""
-        self.inference_mode = True
+        self.prior_knowledge.weight.data = kernel
+        self.prior_knowledge.bias.data = bias
+        self.prior_knowledge.requires_grad_ = False
+        
+        # Reset MobileOne branches to near-zero initialization 
+        if hasattr(self,'rbr_skip'):
+            self.rbr_skip.weight.data *=0.01
+            self.rbr_skip.bias.data.fill_(0)  
+            
+        for conv_bn in self.rbr_conv:
+            conv_bn.conv.weight.data *= 0.01
+            conv_bn.conv.bias.data.fill_(0)
+            conv_bn.bn.weight.data *= 0.01
+            conv_bn.bn.bias.data.fill_(0)
+            conv_bn.bn.running_mean.data.fill_(0)
+            conv_bn.bn.running_var.data.fill_(0)
+        
+        if self.rbr_scale:
+            self.rbr_scale.conv.weight.data *= 0.01
+            self.rbr_scale.conv.bias.data.fill_(0)
+            self.rbr_scale.bn.weight.data *= 0.01
+            self.rbr_scale.bn.bias.data.fill_(0)
+            self.rbr_scale.bn.running_mean.data.fill_(0)
+            self.rbr_scale.bn.running_var.data.fill_(0)            
+        
+        self.meta_mode = True
 
 
     def _get_kernel_bias(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -258,6 +272,13 @@ class MobileOneBlock(nn.Module):
 
         kernel_final = kernel_conv + kernel_scale + kernel_identity
         bias_final = bias_conv + bias_scale + bias_identity
+        
+        ####NOT TESTED:STILL IN DEVELOLPMENT####
+        if hasattr(self, 'prior_knowledge'):
+            kernel_final += self.prior_knowledge.weight.data
+            bias_final += self.prior_knowledge.bias.data
+            
+        
         return kernel_final, bias_final
 
     def _fuse_bn_tensor(self, branch) -> Tuple[torch.Tensor, torch.Tensor]:
